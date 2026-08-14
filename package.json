@@ -1,6 +1,6 @@
 {
   "name": "dsh-browser-playwright",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Playwright-powered browser capability for DeepSeek Harness: accessibility-snapshot interaction with stable element refs, session-scoped browser sessions, screenshots as attachments.",
   "license": "MIT",
   "type": "module",
