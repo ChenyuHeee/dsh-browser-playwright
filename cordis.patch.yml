@@ -1,0 +1,22 @@
+# dsh-browser-playwright bundle layer: the browser seam, the Playwright
+# provider, and the model-facing tool family. Applied as one insert over the
+# profile's entry list; rows are patchable by id like every other plugin.
+- insert:
+    - id: browser
+      name: 'dsh-browser-playwright/service'
+      config:
+        provider: playwright
+    - id: browser-playwright
+      name: 'dsh-browser-playwright/playwright'
+      config:
+        launch:
+          headless: true
+          viewport:
+            width: 1280
+            height: 800
+          navigationTimeoutMs: 30000
+          ignoreHTTPSErrors: false
+        idleTimeoutMs: 600000
+        maxSessions: 8
+    - id: browser-tool
+      name: 'dsh-browser-playwright/tool'

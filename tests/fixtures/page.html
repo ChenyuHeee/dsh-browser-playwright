@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Fixture Store</title>
+  <style>
+    body { font-family: sans-serif; margin: 2rem; }
+    .hidden-box { display: none; }
+  </style>
+</head>
+<body>
+  <h1>Fixture Store</h1>
+  <nav aria-label="Main">
+    <a href="/page-a.html">Page A</a>
+    <a href="/page-b.html">Page B</a>
+  </nav>
+  <main>
+    <p id="status">idle</p>
+    <form>
+      <label for="q">Search</label>
+      <input id="q" name="q" type="text" placeholder="type here">
+      <button id="submit-btn" type="button" onclick="document.getElementById('status').textContent = 'submitted: ' + document.getElementById('q').value">Go</button>
+      <select name="lang" aria-label="Language">
+        <option value="en">English</option>
+        <option value="zh">Chinese</option>
+      </select>
+      <input type="checkbox" id="agree" aria-label="Agree">
+    </form>
+    <button id="count-btn" onclick="document.getElementById('status').textContent = 'clicks: ' + (Number((document.getElementById('status').textContent || '').replace(/[^0-9]/g, '') || 0) + 1)">Count clicks</button>
+    <ul aria-label="Products">
+      <li>Apple</li>
+      <li>Banana</li>
+      <li>Cherry</li>
+    </ul>
+    <div class="hidden-box">invisible secret</div>
+    <a href="https://example.com/absolute">Absolute link</a>
+  </main>
+</body>
+</html>

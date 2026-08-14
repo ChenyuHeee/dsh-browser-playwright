@@ -1,0 +1,2 @@
+# Isolate this out-of-tree plugin from the host monorepo's workspace globs.
+packages: []

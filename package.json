@@ -1,0 +1,78 @@
+{
+  "name": "dsh-browser-playwright",
+  "version": "0.1.0",
+  "description": "Playwright-powered browser capability for DeepSeek Harness: accessibility-snapshot interaction with stable element refs, session-scoped browser sessions, screenshots as attachments.",
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./service": {
+      "types": "./lib/service.d.ts",
+      "default": "./lib/service.js"
+    },
+    "./playwright": {
+      "types": "./lib/playwright.d.ts",
+      "default": "./lib/playwright.js"
+    },
+    "./tool": {
+      "types": "./lib/tool.d.ts",
+      "default": "./lib/tool.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepare": "npm run build",
+    "test": "tsx --test tests/*.test.ts"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "playwright-core": "^1.61.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-llm": ">=0.1.0-rc.2",
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.2"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-agent": ">=0.1.0-rc.2",
+    "@deepseek-ai/dsh-attachment": ">=0.1.0-rc.2",
+    "@deepseek-ai/dsh-llm": ">=0.1.0-rc.2",
+    "@deepseek-ai/dsh-session": ">=0.1.0-rc.2",
+    "@deepseek-ai/dsh-system-prompt": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "@types/node": "^24.13.3",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "browser",
+    "playwright",
+    "web-automation",
+    "agent"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  }
+}

@@ -1,0 +1,17 @@
+# Development overlay: loads dsh-browser-playwright from TypeScript source
+# in this checkout. Plugin paths must be absolute (see docs/user/develop/basic).
+# Usage from the repository root:
+#   pnpm dsh web --patch ./browser-plugin/dev.cordis.yml
+- insert:
+    - id: browser
+      name: '/Users/hechenyu/explore/DSH/browser-plugin/src/service.ts'
+      config:
+        provider: playwright
+    - id: browser-playwright
+      name: '/Users/hechenyu/explore/DSH/browser-plugin/src/playwright.ts'
+      config:
+        launch:
+          headless: true
+          channel: chrome
+    - id: browser-tool
+      name: '/Users/hechenyu/explore/DSH/browser-plugin/src/tool.ts'
