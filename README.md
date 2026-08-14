@@ -111,9 +111,20 @@ Other providers (remote browsers, Browserbase, Steel, …) can register into `ct
 
 ```sh
 pnpm install
-pnpm test          # 24 tests: engine/action integration on real Chrome, policy, rendering, schema assembly
+pnpm test          # full suite: engine/action integration on real Chrome, policy, rendering,
+                   # schema assembly, plus the realistic scenario suites below
 pnpm run build     # tsc → lib/
 ```
+
+### Test suites
+
+| Suite | Command | What it covers |
+|---|---|---|
+| Unit + engine integration | `pnpm test` (included) | Snapshot rendering, schema assembly, URL policy, provider actions on real Chrome |
+| Realistic scenarios | `pnpm test:scenarios` | Scripted-agent journeys over a realistic local store fixture: guest checkout with coupon and validation, login/session persistence, multi-tab research, lazy content, infinite scroll, modal dialogs, popups, screenshots, policy, owner isolation, idle disposal, snapshot budgets — at both the `BrowserSession` level and the model-facing `ctx.tools.execute` level (with fake attachments/LLM services) |
+| Live smoke | `pnpm test:live` | Opt-in checks against the real internet (example.com, Wikipedia REST). Skipped unless `DSH_BROWSER_LIVE=1`; not part of CI |
+
+The scenario suites are the plugin's most realistic tests: they drive the browser the way an agent does — snapshot, find a `ref`, act, re-snapshot — and therefore double as executable documentation of the model experience.
 
 From a DeepSeek Harness source checkout, load this plugin from TypeScript:
 
@@ -146,6 +157,10 @@ The page state itself (DOM, cookies, storage) lives in the browser context and n
 - **Evaluate gate is config, not approval** — enabling `allowEvaluate` trusts the model with arbitrary page JavaScript; compose it with the harness approval/permission policy for stricter control.
 - **Chromium family only** — Firefox/WebKit channels are not probed; providers are swappable if another engine is needed.
 - **Extract needs a dedicated model route** — it does not reuse the main request's route; misconfiguration fails loudly at call time.
+- **Refs are positional per snapshot** — after a client-side re-render, a stale ref number can be reused by a different element, so a stale `browser_click` can act on the wrong element instead of failing (covered by the stale-ref scenario tests). Agents must re-snapshot after DOM changes; a generation-tagged ref would turn this into a fast failure.
+- **`allowedDomains` guards `browser_navigate`/`browser_open_tab` only** — clicking an in-page link to a disallowed host still navigates (documented by the policy scenario test). Check link hrefs at click time if the policy must cover every navigation.
+- **The idle timer is armed at acquire/touch time** — an operation slower than `idleTimeoutMs` can have its context disposed mid-flight; the operation then never settles without a caller abort (documented by the idle-hazard scenario test). Arm the timer only when the session is truly idle to fix.
+- **Snapshots taken mid-navigation throw raw Playwright errors** — after a click that starts a JS navigation (e.g. `location.href` after a form submit), an immediate `browser_snapshot` can fail with "Execution context was destroyed" instead of waiting for the new page. The agent loop retries the tool call; consider catching this and re-evaluating once the navigation settles.
 
 ## License
 
