@@ -111,9 +111,20 @@ Other providers (remote browsers, Browserbase, Steel, …) can register into `ct
 
 ```sh
 pnpm install
-pnpm test          # 24 tests: engine/action integration on real Chrome, policy, rendering, schema assembly
+pnpm test          # full suite: engine/action integration on real Chrome, policy, rendering,
+                   # schema assembly, plus the realistic scenario suites below
 pnpm run build     # tsc → lib/
 ```
+
+### Test suites
+
+| Suite | Command | What it covers |
+|---|---|---|
+| Unit + engine integration | `pnpm test` (included) | Snapshot rendering, schema assembly, URL policy, provider actions on real Chrome |
+| Realistic scenarios | `pnpm test:scenarios` | Scripted-agent journeys over a realistic local store fixture: guest checkout with coupon and validation, login/session persistence, multi-tab research, lazy content, infinite scroll, modal dialogs, popups, screenshots, policy, owner isolation, idle disposal, snapshot budgets — at both the `BrowserSession` level and the model-facing `ctx.tools.execute` level (with fake attachments/LLM services) |
+| Live smoke | `pnpm test:live` | Opt-in checks against the real internet (example.com, Wikipedia REST). Skipped unless `DSH_BROWSER_LIVE=1`; not part of CI |
+
+The scenario suites are the plugin's most realistic tests: they drive the browser the way an agent does — snapshot, find a `ref`, act, re-snapshot — and therefore double as executable documentation of the model experience.
 
 From a DeepSeek Harness source checkout, load this plugin from TypeScript:
 
@@ -146,6 +157,16 @@ The page state itself (DOM, cookies, storage) lives in the browser context and n
 - **Evaluate gate is config, not approval** — enabling `allowEvaluate` trusts the model with arbitrary page JavaScript; compose it with the harness approval/permission policy for stricter control.
 - **Chromium family only** — Firefox/WebKit channels are not probed; providers are swappable if another engine is needed.
 - **Extract needs a dedicated model route** — it does not reuse the main request's route; misconfiguration fails loudly at call time.
+- **JS-driven navigations are not statically checkable** — `allowedDomains` now covers `browser_navigate`, `browser_open_tab`, and link clicks, but a button whose handler runs `location.href = …` can still leave the allowed hosts; deploy an external network guard for hard isolation.
+
+### Ref and lifecycle safety (fixed)
+
+The scenario suites originally surfaced four hazards, now fixed and regression-tested:
+
+- **Stale refs fail fast** — refs carry a per-snapshot nonce, so after a client-side re-render a stale ref matches nothing and `browser_click` fails with `REF_NOT_FOUND` instead of silently acting on a different element.
+- **Link clicks respect `allowedDomains`** — clicking an in-page link to a disallowed host is rejected with `URL_NOT_ALLOWED`.
+- **Idle disposal defers during operations** — a navigation slower than `idleTimeoutMs` completes normally; disposal only fires when the session is truly idle.
+- **Mid-navigation snapshots settle** — a `browser_snapshot` racing a JS navigation waits for the new document and retries instead of surfacing a raw "Execution context was destroyed" error.
 
 ## License
 
