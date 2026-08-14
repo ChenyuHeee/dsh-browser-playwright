@@ -105,6 +105,8 @@ interface FleetEntry {
   readonly context: BrowserContext
   readonly session: PlaywrightSession
   lastUsed: number
+  /** In-flight operations; idle disposal defers while this is above zero. */
+  pending: number
   timer: NodeJS.Timeout | undefined
 }
 
@@ -188,7 +190,7 @@ export class PlaywrightProvider implements BrowserProvider {
     })
     await context.addInitScript(SNAPSHOT_SCRIPT)
     const session = new PlaywrightSession(this, owner, context)
-    const entry: FleetEntry = { context, session, lastUsed: Date.now(), timer: undefined }
+    const entry: FleetEntry = { context, session, lastUsed: Date.now(), pending: 0, timer: undefined }
     this.entries.set(owner, entry)
     this.armIdle(entry)
     void context.on('close', () => {
@@ -225,6 +227,20 @@ export class PlaywrightProvider implements BrowserProvider {
     this.armIdle(entry)
   }
 
+  /** Mark one operation in flight so the idle timer cannot kill it mid-way. */
+  beginOp(owner: string): void {
+    const entry = this.entries.get(owner)
+    if (entry !== undefined) entry.pending += 1
+  }
+
+  /** Settle one operation and restart the idle countdown. */
+  endOp(owner: string): void {
+    const entry = this.entries.get(owner)
+    if (entry === undefined) return
+    entry.pending = Math.max(0, entry.pending - 1)
+    this.touch(owner)
+  }
+
   /** Ensure the session entry for an owner still exists. */
   isLive(owner: string): boolean {
     return this.entries.has(owner)
@@ -236,6 +252,12 @@ export class PlaywrightProvider implements BrowserProvider {
     const idle = this.config.idleTimeoutMs
     if (idle <= 0) return
     entry.timer = setTimeout(() => {
+      // A slow operation can outlive the idle window; defer disposal until
+      // it settles instead of killing its browser context mid-flight.
+      if (entry.pending > 0) {
+        this.armIdle(entry)
+        return
+      }
       void this.disposeOwner(entry.session.owner)
     }, idle)
     entry.timer.unref?.()
@@ -295,201 +317,277 @@ class PlaywrightSession implements BrowserSession {
     private readonly context: BrowserContext,
   ) {}
 
+  /** Run one operation under busy tracking: idle disposal defers until it settles. */
+  private run<T>(operation: () => Promise<T>): Promise<T> {
+    this.provider.beginOp(this.owner)
+    return Promise.resolve()
+      .then(operation)
+      .finally(() => this.provider.endOp(this.owner))
+  }
+
+  /** Wait for an in-flight navigation (started by a click) to settle. */
+  private async settleNavigation(page: Page): Promise<void> {
+    await page.waitForLoadState('domcontentloaded', { timeout: this.timeoutMs() }).catch(() => { /* already settled; the retry below decides */ })
+  }
+
   async navigate(url: string, waitUntil: LoadState, signal?: AbortSignal): Promise<BrowserSnapshot> {
-    const target = assertAllowedUrl(url, this.provider.config.allowedDomains ?? [])
-    const page = await this.ensurePage()
-    try {
-      await withAbort(page.goto(target.toString(), { waitUntil, timeout: this.timeoutMs() }), signal)
-    } catch (error: unknown) {
-      if (isAbortError(error) || (signal?.aborted === true)) throw error
-      throw asTimeoutError('navigation', error)
-    }
-    return this.snapshot()
+    return this.run(async () => {
+      const target = assertAllowedUrl(url, this.provider.config.allowedDomains ?? [])
+      const page = await this.ensurePage()
+      try {
+        await withAbort(page.goto(target.toString(), { waitUntil, timeout: this.timeoutMs() }), signal)
+      } catch (error: unknown) {
+        if (isAbortError(error) || (signal?.aborted === true)) throw error
+        throw asTimeoutError('navigation', error)
+      }
+      return this.snapshot()
+    })
   }
 
   async snapshot(opts?: { readonly interactiveOnly?: boolean }): Promise<BrowserSnapshot> {
-    this.assertLive()
-    const page = await this.ensurePage()
-    this.provider.touch(this.owner)
-    const o: SnapshotOptions = {
-      ...(opts?.interactiveOnly !== undefined ? { interactiveOnly: opts.interactiveOnly } : {}),
-      maxNodes: this.provider.config.snapshot.maxNodes,
-      maxNameLength: this.provider.config.snapshot.maxNameLength,
-      maxTextLength: this.provider.config.snapshot.maxTextLength,
-    }
-    const raw = await page.evaluate((options: SnapshotOptions) => {
-      const fn = (window as unknown as { __dshSnapshot?: (o: unknown) => unknown }).__dshSnapshot
-      if (typeof fn !== 'function') return { nodes: [], truncated: false, totalRefs: 0, missing: true }
-      return fn(options)
-    }, o) as { nodes: BrowserNode[]; truncated: boolean; totalRefs: number; missing?: boolean }
-    return {
-      url: page.url(),
-      title: await page.title(),
-      nodes: raw.nodes ?? [],
-      totalRefs: raw.totalRefs ?? 0,
-      truncated: raw.truncated ?? false,
-    }
+    return this.run(async () => {
+      this.assertLive()
+      const page = await this.ensurePage()
+      this.provider.touch(this.owner)
+      const o: SnapshotOptions = {
+        ...(opts?.interactiveOnly !== undefined ? { interactiveOnly: opts.interactiveOnly } : {}),
+        maxNodes: this.provider.config.snapshot.maxNodes,
+        maxNameLength: this.provider.config.snapshot.maxNameLength,
+        maxTextLength: this.provider.config.snapshot.maxTextLength,
+      }
+      const read = (options: SnapshotOptions) => {
+        const fn = (window as unknown as { __dshSnapshot?: (o: unknown) => unknown }).__dshSnapshot
+        if (typeof fn !== 'function') return { nodes: [], truncated: false, totalRefs: 0, missing: true }
+        return fn(options)
+      }
+      type RawSnapshot = { nodes: BrowserNode[]; truncated: boolean; totalRefs: number; missing?: boolean }
+      let raw: RawSnapshot
+      try {
+        raw = await page.evaluate(read, o) as RawSnapshot
+      } catch (error: unknown) {
+        // A click can start a JS navigation that destroys the execution
+        // context mid-evaluate; wait for the new document and retry once.
+        if (!isContextDestroyed(error)) throw error
+        await this.settleNavigation(page)
+        raw = await page.evaluate(read, o) as RawSnapshot
+      }
+      return {
+        url: page.url(),
+        title: await page.title(),
+        nodes: raw.nodes ?? [],
+        totalRefs: raw.totalRefs ?? 0,
+        truncated: raw.truncated ?? false,
+      }
+    })
   }
 
   async click(ref: string, signal?: AbortSignal): Promise<BrowserSnapshot> {
-    const locator = this.refLocator(ref)
-    try {
-      await withAbort(locator.click({ timeout: this.timeoutMs() }), signal)
-    } catch (error: unknown) {
-      if (isAbortError(error)) throw error
-      throw asTimeoutError('action', error)
-    }
-    return this.snapshot()
+    return this.run(async () => {
+      const locator = await this.refLocator(ref)
+      // Click navigation does not run through navigate(); enforce the URL
+      // policy for link destinations here as well.
+      const href = await locator.getAttribute('href')
+      if (href !== null) {
+        assertAllowedUrl(new URL(href, this.currentPageSync().url()).toString(), this.provider.config.allowedDomains ?? [])
+      }
+      try {
+        await withAbort(locator.click({ timeout: this.timeoutMs() }), signal)
+      } catch (error: unknown) {
+        if (isAbortError(error)) throw error
+        throw asTimeoutError('action', error)
+      }
+      return this.snapshot()
+    })
   }
 
   async fill(ref: string, text: string, signal?: AbortSignal): Promise<BrowserSnapshot> {
-    const locator = this.refLocator(ref)
-    try {
-      const tag = await locator.evaluate(el => el.tagName.toLowerCase())
-      if (tag === 'select') {
-        await withAbort(locator.selectOption({ label: text }, { timeout: this.timeoutMs() }), signal)
-      } else {
-        await withAbort(locator.fill(text, { timeout: this.timeoutMs() }), signal)
+    return this.run(async () => {
+      const locator = await this.refLocator(ref)
+      try {
+        const tag = await locator.evaluate(el => el.tagName.toLowerCase())
+        if (tag === 'select') {
+          await withAbort(locator.selectOption({ label: text }, { timeout: this.timeoutMs() }), signal)
+        } else {
+          await withAbort(locator.fill(text, { timeout: this.timeoutMs() }), signal)
+        }
+      } catch (error: unknown) {
+        if (isAbortError(error)) throw error
+        throw asTimeoutError('action', error)
       }
-    } catch (error: unknown) {
-      if (isAbortError(error)) throw error
-      throw asTimeoutError('action', error)
-    }
-    return this.snapshot()
+      return this.snapshot()
+    })
   }
 
   async press(ref: string, key: string, signal?: AbortSignal): Promise<BrowserSnapshot> {
-    const locator = this.refLocator(ref)
-    try {
-      await withAbort(locator.press(key, { timeout: this.timeoutMs() }), signal)
-    } catch (error: unknown) {
-      if (isAbortError(error)) throw error
-      throw asTimeoutError('action', error)
-    }
-    return this.snapshot()
+    return this.run(async () => {
+      const locator = await this.refLocator(ref)
+      try {
+        await withAbort(locator.press(key, { timeout: this.timeoutMs() }), signal)
+      } catch (error: unknown) {
+        if (isAbortError(error)) throw error
+        throw asTimeoutError('action', error)
+      }
+      return this.snapshot()
+    })
   }
 
   async scroll(direction: 'up' | 'down', amount: number, ref: string | undefined, signal?: AbortSignal): Promise<BrowserSnapshot> {
-    const page = await this.ensurePage()
-    try {
-      if (ref !== undefined) {
-        await withAbort(this.refLocator(ref).scrollIntoViewIfNeeded({ timeout: this.timeoutMs() }), signal)
+    return this.run(async () => {
+      const page = await this.ensurePage()
+      try {
+        if (ref !== undefined) {
+          await withAbort((await this.refLocator(ref)).scrollIntoViewIfNeeded({ timeout: this.timeoutMs() }), signal)
+        }
+        const delta = direction === 'down' ? amount : -amount
+        await withAbort(page.mouse.wheel(0, delta), signal)
+      } catch (error: unknown) {
+        if (isAbortError(error)) throw error
+        throw asTimeoutError('action', error)
       }
-      const delta = direction === 'down' ? amount : -amount
-      await withAbort(page.mouse.wheel(0, delta), signal)
-    } catch (error: unknown) {
-      if (isAbortError(error)) throw error
-      throw asTimeoutError('action', error)
-    }
-    return this.snapshot()
+      return this.snapshot()
+    })
   }
 
   async back(signal?: AbortSignal): Promise<BrowserSnapshot> {
-    const page = await this.ensurePage()
-    try {
-      await withAbort(page.goBack({ timeout: this.timeoutMs() }), signal)
-    } catch (error: unknown) {
-      if (isAbortError(error)) throw error
-      throw asTimeoutError('navigation', error)
-    }
-    return this.snapshot()
+    return this.run(async () => {
+      const page = await this.ensurePage()
+      try {
+        await withAbort(page.goBack({ timeout: this.timeoutMs() }), signal)
+      } catch (error: unknown) {
+        if (isAbortError(error)) throw error
+        throw asTimeoutError('navigation', error)
+      }
+      return this.snapshot()
+    })
   }
 
   async forward(signal?: AbortSignal): Promise<BrowserSnapshot> {
-    const page = await this.ensurePage()
-    try {
-      await withAbort(page.goForward({ timeout: this.timeoutMs() }), signal)
-    } catch (error: unknown) {
-      if (isAbortError(error)) throw error
-      throw asTimeoutError('navigation', error)
-    }
-    return this.snapshot()
+    return this.run(async () => {
+      const page = await this.ensurePage()
+      try {
+        await withAbort(page.goForward({ timeout: this.timeoutMs() }), signal)
+      } catch (error: unknown) {
+        if (isAbortError(error)) throw error
+        throw asTimeoutError('navigation', error)
+      }
+      return this.snapshot()
+    })
   }
 
   async wait(ms: number, signal?: AbortSignal): Promise<void> {
-    this.provider.touch(this.owner)
-    await withAbort(new Promise<void>(resolve => setTimeout(resolve, ms)), signal)
+    return this.run(async () => {
+      this.provider.touch(this.owner)
+      await withAbort(new Promise<void>(resolve => setTimeout(resolve, ms)), signal)
+    })
   }
 
   async tabs(): Promise<readonly TabInfo[]> {
-    this.assertLive()
-    this.provider.touch(this.owner)
-    const pages = this.context.pages()
-    const out: TabInfo[] = []
-    for (let index = 0; index < pages.length; index += 1) {
-      const page = pages[index]
-      if (page === undefined) continue
-      out.push({ index, url: page.url(), title: await page.title() })
-    }
-    return out
+    return this.run(async () => {
+      this.assertLive()
+      this.provider.touch(this.owner)
+      const pages = this.context.pages()
+      const out: TabInfo[] = []
+      for (let index = 0; index < pages.length; index += 1) {
+        const page = pages[index]
+        if (page === undefined) continue
+        out.push({ index, url: page.url(), title: await page.title() })
+      }
+      return out
+    })
   }
 
   async switchTab(index: number, signal?: AbortSignal): Promise<BrowserSnapshot> {
-    this.assertLive()
-    const page = this.pageAt(index)
-    if (page === undefined) throw new BrowserError('REF_NOT_FOUND', 'no tab at index ' + String(index))
-    this.currentIndex = index
-    await withAbort(page.bringToFront(), signal)
-    return this.snapshot()
+    return this.run(async () => {
+      this.assertLive()
+      const page = this.pageAt(index)
+      if (page === undefined) throw new BrowserError('REF_NOT_FOUND', 'no tab at index ' + String(index))
+      this.currentIndex = index
+      await withAbort(page.bringToFront(), signal)
+      return this.snapshot()
+    })
   }
 
   async openTab(url: string, waitUntil: LoadState, signal?: AbortSignal): Promise<BrowserSnapshot> {
-    this.assertLive()
-    const target = assertAllowedUrl(url, this.provider.config.allowedDomains ?? [])
-    const page = await this.context.newPage()
-    this.currentIndex = this.context.pages().length - 1
-    try {
-      await withAbort(page.goto(target.toString(), { waitUntil, timeout: this.timeoutMs() }), signal)
-    } catch (error: unknown) {
-      if (isAbortError(error)) throw error
-      throw asTimeoutError('navigation', error)
-    }
-    return this.snapshot()
+    return this.run(async () => {
+      this.assertLive()
+      const target = assertAllowedUrl(url, this.provider.config.allowedDomains ?? [])
+      const page = await this.context.newPage()
+      this.currentIndex = this.context.pages().length - 1
+      try {
+        await withAbort(page.goto(target.toString(), { waitUntil, timeout: this.timeoutMs() }), signal)
+      } catch (error: unknown) {
+        if (isAbortError(error)) throw error
+        throw asTimeoutError('navigation', error)
+      }
+      return this.snapshot()
+    })
   }
 
   async closeTab(index: number, signal?: AbortSignal): Promise<void> {
-    this.assertLive()
-    const pages = this.context.pages()
-    const page = pages[index]
-    if (page === undefined) throw new BrowserError('REF_NOT_FOUND', 'no tab at index ' + String(index))
-    if (pages.length <= 1) {
-      await withAbort(page.goto('about:blank'), signal)
-      return
-    }
-    await withAbort(page.close(), signal)
-    this.currentIndex = Math.min(this.currentIndex, this.context.pages().length - 1)
+    return this.run(async () => {
+      this.assertLive()
+      const pages = this.context.pages()
+      const page = pages[index]
+      if (page === undefined) throw new BrowserError('REF_NOT_FOUND', 'no tab at index ' + String(index))
+      if (pages.length <= 1) {
+        await withAbort(page.goto('about:blank'), signal)
+        return
+      }
+      await withAbort(page.close(), signal)
+      this.currentIndex = Math.min(this.currentIndex, this.context.pages().length - 1)
+    })
   }
 
   async screenshot(opts: { readonly fullPage?: boolean; readonly ref?: string } | undefined, signal?: AbortSignal): Promise<ScreenshotCapture> {
-    this.assertLive()
-    this.provider.touch(this.owner)
-    const page = await this.ensurePage()
-    if (opts?.ref !== undefined) {
-      const bytes = await withAbort(this.refLocator(opts.ref).screenshot({ type: 'png', timeout: this.timeoutMs() }), signal)
+    return this.run(async () => {
+      this.assertLive()
+      this.provider.touch(this.owner)
+      const page = await this.ensurePage()
+      if (opts?.ref !== undefined) {
+        const bytes = await withAbort((await this.refLocator(opts.ref)).screenshot({ type: 'png', timeout: this.timeoutMs() }), signal)
+        return { mime: 'image/png', bytes }
+      }
+      const bytes = await withAbort(page.screenshot({ type: 'png', fullPage: opts?.fullPage ?? false, animations: 'disabled', caret: 'hide', timeout: this.timeoutMs() }), signal)
       return { mime: 'image/png', bytes }
-    }
-    const bytes = await withAbort(page.screenshot({ type: 'png', fullPage: opts?.fullPage ?? false, animations: 'disabled', caret: 'hide', timeout: this.timeoutMs() }), signal)
-    return { mime: 'image/png', bytes }
+    })
   }
 
   async pageData(): Promise<PageData> {
-    this.assertLive()
-    this.provider.touch(this.owner)
-    const page = await this.ensurePage()
-    const data = await page.evaluate(() => {
-      const fn = (window as unknown as { __dshPageData?: (o: unknown) => unknown }).__dshPageData
-      if (typeof fn !== 'function') return { url: location.href, title: document.title, text: '', truncated: false, links: [], inputs: [] }
-      return fn({ maxTextChars: 30000, maxLinks: 300, maxInputs: 200 })
+    return this.run(async () => {
+      this.assertLive()
+      this.provider.touch(this.owner)
+      const page = await this.ensurePage()
+      const read = () => {
+        const fn = (window as unknown as { __dshPageData?: (o: unknown) => unknown }).__dshPageData
+        if (typeof fn !== 'function') return { url: location.href, title: document.title, text: '', truncated: false, links: [], inputs: [] }
+        return fn({ maxTextChars: 30000, maxLinks: 300, maxInputs: 200 })
+      }
+      let data: unknown
+      try {
+        data = await page.evaluate(read)
+      } catch (error: unknown) {
+        if (!isContextDestroyed(error)) throw error
+        await this.settleNavigation(page)
+        data = await page.evaluate(read)
+      }
+      return data as PageData
     })
-    return data as PageData
   }
 
   async evaluate(expression: string, signal?: AbortSignal): Promise<unknown> {
-    this.assertLive()
-    this.provider.touch(this.owner)
-    const page = await this.ensurePage()
-    const fn = new Function('return (' + expression + ')') as () => unknown
-    return withAbort(page.evaluate(fn), signal)
+    return this.run(async () => {
+      this.assertLive()
+      this.provider.touch(this.owner)
+      const page = await this.ensurePage()
+      const fn = new Function('return (' + expression + ')') as () => unknown
+      try {
+        return await withAbort(page.evaluate(fn), signal)
+      } catch (error: unknown) {
+        if (!isContextDestroyed(error) || signal?.aborted === true) throw error
+        await this.settleNavigation(page)
+        return withAbort(page.evaluate(fn), signal)
+      }
+    })
   }
 
   async close(): Promise<void> {
@@ -524,12 +622,18 @@ class PlaywrightSession implements BrowserSession {
     return this.context.pages()[index]
   }
 
-  private refLocator(ref: string): import('playwright-core').Locator {
+  private async refLocator(ref: string): Promise<import('playwright-core').Locator> {
     this.assertLive()
     if (!REF_PATTERN.test(ref)) {
       throw new BrowserError('REF_NOT_FOUND', 'invalid ref ' + JSON.stringify(ref) + ': use a ref from the latest browser_snapshot')
     }
-    return this.currentPageSync().locator('[data-dsh-ref="' + ref + '"]').first()
+    const locator = this.currentPageSync().locator('[data-dsh-ref="' + ref + '"]').first()
+    // Fast-fail on stale refs (per-snapshot nonces make a reused number
+    // impossible) instead of burning the full action timeout.
+    if (await locator.count() === 0) {
+      throw new BrowserError('REF_NOT_FOUND', 'ref ' + JSON.stringify(ref) + ' no longer matches an element; take a fresh browser_snapshot and use a ref from its result')
+    }
+    return locator
   }
 
   private currentPageSync(): Page {
@@ -549,4 +653,9 @@ class PlaywrightSession implements BrowserSession {
 /** Whether an error is a caller-initiated abort, which must propagate untouched. */
 function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === 'AbortError'
+}
+
+/** Whether a Playwright failure is a mid-evaluate navigation race. */
+function isContextDestroyed(error: unknown): boolean {
+  return error instanceof Error && /Execution context was destroyed/.test(error.message)
 }

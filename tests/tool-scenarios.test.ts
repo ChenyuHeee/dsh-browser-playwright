@@ -353,7 +353,7 @@ test('policy surface: a disallowed URL is a structured tool failure', async () =
 // Scenario: refs go stale across re-renders; the model re-snapshots
 // ---------------------------------------------------------------------------
 
-test('stale ref surface: an outdated ref fails, then a fresh snapshot recovers', async () => {
+test('stale ref surface: an outdated ref fails fast, then a fresh snapshot recovers', async () => {
   const ctx = await assemble()
   const nav = await call(ctx, 'browser_navigate', { url: store.base + '/?nopromo=1' })
   const keyboardRef = refInTree(treeOf(nav), 'link', 'Mechanical Keyboard')
@@ -365,16 +365,15 @@ test('stale ref surface: an outdated ref fails, then a fresh snapshot recovers',
   await call(ctx, 'browser_click', { ref: kitchenRef })
   await callUntil(ctx, 'browser_snapshot', {}, value => !(value as { tree: string }).tree.includes('Mechanical Keyboard'), 'filtered grid')
 
-  // KNOWN ISSUE (documented hazard): the stale ref number is reused by a
-  // different element after the re-render, so the click succeeds against the
-  // wrong product instead of failing. See the provider-level stale-ref test.
+  // Per-snapshot ref nonces make the stale ref match nothing: the tool fails
+  // fast with a REF_NOT_FOUND explanation instead of clicking the wrong
+  // element, and the model can recover from the error text alone.
   const stale = await call(ctx, 'browser_click', { ref: keyboardRef })
-  assert.equal(stale.isError, false)
-  assert.ok((stale.value as { url: string }).url.includes('/product/kettle'), 'stale click lands on the wrong product (known hazard)')
+  assert.equal(stale.isError, true)
+  assert.ok(textBlock(stale).includes('no longer matches'), 'the failure must explain that refs went stale')
 
-  // Recovery: history back, fresh snapshot, fresh ref.
-  await call(ctx, 'browser_back', {})
-  const fresh = await callUntil(ctx, 'browser_snapshot', {}, value => (value as { tree: string }).tree.includes('Burr Coffee Grinder'), 'filtered grid after back')
+  // Recovery: fresh snapshot, fresh ref.
+  const fresh = await call(ctx, 'browser_snapshot', {})
   const grinderRef = refInTree(treeOf(fresh), 'link', 'Burr Coffee Grinder')
   assert.ok(grinderRef !== null)
   await call(ctx, 'browser_click', { ref: grinderRef })

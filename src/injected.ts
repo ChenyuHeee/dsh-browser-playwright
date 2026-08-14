@@ -33,7 +33,13 @@ export interface PageDataOptions {
 export const SNAPSHOT_SCRIPT: string = String.raw`
 ;(() => {
   if (window.__dshSnapshot) return // one install per document
-  let lastRefs = []
+  // Refs are stable for an element's whole lifetime and unique across the
+  // session: the per-document nonce separates documents (navigations), and
+  // the per-document sequence never reuses a number. Re-rendered elements
+  // are new nodes, so they mint new refs — a stale ref can never silently
+  // match a different element.
+  const DOC_NONCE = String(Math.floor(Math.random() * 1e9)).padStart(9, '0')
+  let refSeq = 0
 
   const SKIP_TAGS = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'head', 'br', 'hr', 'svg'])
   const INTERACTIVE_ROLES = new Set(['button', 'link', 'checkbox', 'radio', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'tab', 'switch', 'combobox', 'listbox', 'option', 'textbox', 'searchbox', 'slider', 'spinbutton', 'row', 'gridcell'])
@@ -121,9 +127,13 @@ export const SNAPSHOT_SCRIPT: string = String.raw`
     return clip(ownText(el, maxText), maxName)
   }
 
-  function assignRef(el) {
-    const ref = 'e' + String(lastRefs.length + 1)
-    lastRefs.push(el)
+  function assignRef(el, state) {
+    state.refCount += 1
+    // Reuse the ref minted for this element by an earlier snapshot of this
+    // document, so refs stay stable across snapshots while the DOM is intact.
+    const existing = el.getAttribute('data-dsh-ref')
+    if (existing !== null) return existing
+    const ref = 'e' + DOC_NONCE + String(++refSeq)
     try { el.setAttribute('data-dsh-ref', ref) } catch (_) { /* foreign objects */ }
     return ref
   }
@@ -147,7 +157,7 @@ export const SNAPSHOT_SCRIPT: string = String.raw`
       return null
     }
     const node = { role, name: nameOf(el, opts.maxNameLength, opts.maxTextLength) }
-    if (actionable) node.ref = assignRef(el)
+    if (actionable) node.ref = assignRef(el, state)
     if (role === 'heading') {
       const m = /^h([1-6])$/.exec(el.tagName.toLowerCase())
       if (m) node.level = Number(m[1])
@@ -194,17 +204,13 @@ export const SNAPSHOT_SCRIPT: string = String.raw`
   }
 
   window.__dshSnapshot = (opts) => {
-    for (const el of lastRefs) {
-      try { el.removeAttribute('data-dsh-ref') } catch (_) { /* ignore */ }
-    }
-    lastRefs = []
     const o = {
       interactiveOnly: !!opts.interactiveOnly,
       maxNodes: opts.maxNodes || 500,
       maxNameLength: opts.maxNameLength || 120,
       maxTextLength: opts.maxTextLength || 300,
     }
-    const state = { count: 0, truncated: false, depth: 0 }
+    const state = { count: 0, truncated: false, depth: 0, refCount: 0 }
     const nodes = []
     if (document.body) {
       for (const child of document.body.children) {
@@ -214,7 +220,7 @@ export const SNAPSHOT_SCRIPT: string = String.raw`
         if (node) nodes.push(node)
       }
     }
-    return { nodes, truncated: state.truncated, totalRefs: lastRefs.length }
+    return { nodes, truncated: state.truncated, totalRefs: state.refCount }
   }
 
   window.__dshPageData = (opts) => {

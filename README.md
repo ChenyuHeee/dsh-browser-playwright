@@ -157,10 +157,16 @@ The page state itself (DOM, cookies, storage) lives in the browser context and n
 - **Evaluate gate is config, not approval** — enabling `allowEvaluate` trusts the model with arbitrary page JavaScript; compose it with the harness approval/permission policy for stricter control.
 - **Chromium family only** — Firefox/WebKit channels are not probed; providers are swappable if another engine is needed.
 - **Extract needs a dedicated model route** — it does not reuse the main request's route; misconfiguration fails loudly at call time.
-- **Refs are positional per snapshot** — after a client-side re-render, a stale ref number can be reused by a different element, so a stale `browser_click` can act on the wrong element instead of failing (covered by the stale-ref scenario tests). Agents must re-snapshot after DOM changes; a generation-tagged ref would turn this into a fast failure.
-- **`allowedDomains` guards `browser_navigate`/`browser_open_tab` only** — clicking an in-page link to a disallowed host still navigates (documented by the policy scenario test). Check link hrefs at click time if the policy must cover every navigation.
-- **The idle timer is armed at acquire/touch time** — an operation slower than `idleTimeoutMs` can have its context disposed mid-flight; the operation then never settles without a caller abort (documented by the idle-hazard scenario test). Arm the timer only when the session is truly idle to fix.
-- **Snapshots taken mid-navigation throw raw Playwright errors** — after a click that starts a JS navigation (e.g. `location.href` after a form submit), an immediate `browser_snapshot` can fail with "Execution context was destroyed" instead of waiting for the new page. The agent loop retries the tool call; consider catching this and re-evaluating once the navigation settles.
+- **JS-driven navigations are not statically checkable** — `allowedDomains` now covers `browser_navigate`, `browser_open_tab`, and link clicks, but a button whose handler runs `location.href = …` can still leave the allowed hosts; deploy an external network guard for hard isolation.
+
+### Ref and lifecycle safety (fixed)
+
+The scenario suites originally surfaced four hazards, now fixed and regression-tested:
+
+- **Stale refs fail fast** — refs carry a per-snapshot nonce, so after a client-side re-render a stale ref matches nothing and `browser_click` fails with `REF_NOT_FOUND` instead of silently acting on a different element.
+- **Link clicks respect `allowedDomains`** — clicking an in-page link to a disallowed host is rejected with `URL_NOT_ALLOWED`.
+- **Idle disposal defers during operations** — a navigation slower than `idleTimeoutMs` completes normally; disposal only fires when the session is truly idle.
+- **Mid-navigation snapshots settle** — a `browser_snapshot` racing a JS navigation waits for the new document and retries instead of surfacing a raw "Execution context was destroyed" error.
 
 ## License
 

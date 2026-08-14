@@ -51,23 +51,10 @@ before(async () => {
   policyProvider = new PlaywrightProvider(providerConfig({ allowedDomains: ['127.0.0.1'] }))
   // Tiny token budgets exercise the truncation path on real pages.
   boundedProvider = new PlaywrightProvider(providerConfig({ snapshot: { maxNodes: 60, maxNameLength: 20, maxTextLength: 60 } }))
-  // A very short idle timer exercises real session disposal. Warm the
-  // provider up so test navigations are not the cold-Chrome one — the very
-  // first navigation on a freshly launched Chrome can outlive the idle
-  // window and be killed mid-flight (the idle hazard). Retry with a
-  // watchdog until one lands; each retry reuses the now-warm browser.
+  // A very short idle timer exercises real session disposal. In-flight
+  // operations are protected by busy tracking, so no warmup is needed: even
+  // a slow first navigation survives the idle window.
   idleProvider = new PlaywrightProvider(providerConfig({ idleTimeoutMs: 500 }))
-  for (let attempt = 0; ; attempt += 1) {
-    assert.ok(attempt < 5, 'idle provider warmup never settled')
-    try {
-      await (await idleProvider.acquire('warmup')).navigate(store.base + '/?nopromo=1', 'load', AbortSignal.timeout(3000))
-      break
-    } catch {
-      await idleProvider.disposeOwner('warmup')
-      await sleep(50)
-    }
-  }
-  await idleProvider.disposeOwner('warmup')
 })
 
 after(async () => {
@@ -358,35 +345,27 @@ test('stale-ref journey: filter re-render invalidates refs; a fresh snapshot rec
   await s.click(await refOf(s, { role: 'button', name: 'Kitchen' }, 'kitchen filter'))
   await waitFor(s, snap => countNodes(snap.nodes, { role: 'link', name: 'Mechanical Keyboard' }) === 0, 'filtered grid')
 
-  // KNOWN ISSUE (documented hazard): refs are positional (e1, e2, … per
-  // snapshot), so after a re-render a stale ref number can be REUSED by a
-  // different element. The click below does not fail — it silently opens the
-  // wrong product. A generation-tagged ref (or an identity check at click
-  // time) would turn this into a fast REF_NOT_FOUND. Until then, agents must
-  // re-snapshot after any DOM change and verify the destination.
-  const misdirected = await s.click(keyboardRef)
-  assert.ok(
-    misdirected.url.includes('/product/kettle'),
-    'stale ref e12 is reused for the Kettle link — click lands on the wrong product (known hazard)',
+  // Ref numbers are unique per snapshot (a nonce prefixes every ref), so
+  // after the re-render the stale ref matches nothing and fails fast with
+  // REF_NOT_FOUND instead of silently acting on a different element.
+  await assert.rejects(
+    s.click(keyboardRef),
+    (err: unknown) => err instanceof BrowserError && err.code === 'REF_NOT_FOUND',
+    'stale refs must fail fast with REF_NOT_FOUND',
   )
-  assert.match(text(misdirected), /Gooseneck Kettle/, 'the wrong product page opened')
 
-  // The recovery loop: go back, take a fresh snapshot, act on its refs.
-  await s.back()
-  await waitFor(s, snap => countNodes(snap.nodes, { role: 'link', name: 'Burr Coffee Grinder' }) === 1, 'filtered grid after back')
+  // The failed click left the page untouched; a fresh snapshot recovers.
   const grinderRef = await refOf(s, { role: 'link', name: 'Burr Coffee Grinder' }, 'kitchen product after filter')
   const grinder = await s.click(grinderRef)
   await waitFor(s, snap => snap.url.includes('/product/grinder'), 'grinder product page')
   assert.match(text(grinder), /\$119\.50/)
 
-  // A ref that outlives every element (nothing reuses its number) does fail
-  // fast with ACTION_TIMEOUT instead of misclicking.
-  await s.navigate(store.base + '/?nopromo=1', 'load')
+  // A fabricated ref number fails the same fast way.
   const snapshot = await s.snapshot()
   const highRef = 'e' + String(snapshot.totalRefs + 50)
   await assert.rejects(
     s.click(highRef),
-    (err: unknown) => err instanceof BrowserError && err.code === 'ACTION_TIMEOUT',
+    (err: unknown) => err instanceof BrowserError && err.code === 'REF_NOT_FOUND',
     'refs with no current element must fail rather than click something',
   )
 })
@@ -507,7 +486,7 @@ test('screenshot-and-evaluate journey: element capture, full-page capture, page 
 // Scenario: navigation policy
 // ---------------------------------------------------------------------------
 
-test('policy journey: allowedDomains blocks other hosts; click-through is unguarded (documented gap)', async () => {
+test('policy journey: allowedDomains blocks both navigation and link clicks', async () => {
   const s = await policyProvider.acquire('policy')
 
   // 127.0.0.1 is allowed…
@@ -520,15 +499,18 @@ test('policy journey: allowedDomains blocks other hosts; click-through is unguar
     (err: unknown) => err instanceof BrowserError && err.code === 'URL_NOT_ALLOWED',
   )
 
-  // NOTE: document the current behavior — clicking a link to a disallowed host
-  // navigates because click navigation does not run through assertAllowedUrl.
-  // If the policy should cover every navigation, this assertion must flip to
-  // expect URL_NOT_ALLOWED and the provider needs a click-time URL check.
+  // Link clicks are checked against the policy at click time too.
   const snap = await s.snapshot()
   const docsRef = refFrom(snap, { role: 'link', name: 'External docs' })
   assert.ok(docsRef !== undefined, 'external docs footer link')
-  const after = await s.click(docsRef)
-  assert.ok(after.url.startsWith('http://localhost:'), 'click navigation currently bypasses allowedDomains')
+  await assert.rejects(
+    s.click(docsRef),
+    (err: unknown) => err instanceof BrowserError && err.code === 'URL_NOT_ALLOWED',
+    'clicking a link to a disallowed host must be rejected',
+  )
+  // The rejected click left the page on the allowed host.
+  const after = await s.snapshot()
+  assert.ok(after.url.startsWith('http://127.0.0.1:'), 'the page must stay on the allowed host')
 })
 
 // ---------------------------------------------------------------------------
@@ -581,20 +563,14 @@ test('idle journey: an untouched session is disposed and transparently recreated
   assert.equal(fresh.title, 'Acme Store')
 })
 
-test('idle hazard (documented): a navigation outliving the idle window dies mid-flight', async () => {
-  // KNOWN ISSUE: the idle timer is armed at acquire/touch time, so disposal
-  // can fire while an operation is still running. The in-flight navigation
-  // then never settles on its own — only a caller abort unblocks it. This
-  // test pins that behavior with a watchdog signal so a future fix (e.g.
-  // arming the timer only when the session is truly idle) can flip it.
+test('idle safety: a navigation slower than the idle window completes normally', async () => {
+  // Busy tracking defers idle disposal while an operation is in flight, so a
+  // slow navigation (600ms response) outlives the 500ms idle window instead
+  // of being killed mid-flight.
   const s = await idleProvider.acquire('idle-slow')
-  const controller = new AbortController()
-  setTimeout(() => controller.abort(), 2500)
-  await assert.rejects(
-    s.navigate(store.base + '/slow-load', 'load', controller.signal),
-    (err: unknown) => err instanceof Error,
-    'a navigation killed by idle disposal must surface as a failure once aborted',
-  )
+  const snap = await s.navigate(store.base + '/slow-load', 'load')
+  assert.equal(snap.title, 'Slow load')
+  assert.match(text(snap), /Loaded eventually/)
 })
 
 // ---------------------------------------------------------------------------
