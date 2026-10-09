@@ -8,6 +8,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { chromium, type Browser, type BrowserContext, type Page } from 'playwright-core'
 import z from '@deepseek-ai/schemastery'
 import { BrowserError, launchFailed } from './errors.ts'
+import { createBackgroundPage, isWindowMinimized } from './window.ts'
 // Type-only: makes the ctx.browser declaration merge visible to this module.
 import type {} from './service.ts'
 import { SNAPSHOT_SCRIPT, type SnapshotOptions } from './injected.ts'
@@ -502,7 +503,10 @@ class PlaywrightSession implements BrowserSession {
       const page = this.pageAt(index)
       if (page === undefined) throw new BrowserError('REF_NOT_FOUND', 'no tab at index ' + String(index))
       this.currentIndex = index
-      await withAbort(page.bringToFront(), signal)
+      // Tab selection is a context-level concern: the OS window does not have to
+      // come forward for the agent to keep driving this tab. Skipping activation
+      // while the window is minimized is what keeps the user's desktop untouched.
+      if (!(await isWindowMinimized(page))) await withAbort(page.bringToFront(), signal)
       return this.snapshot()
     })
   }
@@ -511,7 +515,7 @@ class PlaywrightSession implements BrowserSession {
     return this.run(async () => {
       this.assertLive()
       const target = assertAllowedUrl(url, this.provider.config.allowedDomains ?? [])
-      const page = await this.context.newPage()
+      const page = await createBackgroundPage(this.context)
       this.currentIndex = this.context.pages().length - 1
       try {
         await withAbort(page.goto(target.toString(), { waitUntil, timeout: this.timeoutMs() }), signal)
@@ -604,14 +608,16 @@ class PlaywrightSession implements BrowserSession {
     this.assertLive()
     const pages = this.context.pages()
     if (pages.length === 0) {
-      const created = await this.context.newPage()
+      // No anchor page exists yet, so the window cannot be raised on purpose --
+      // the helper degrades to newPage() in exactly this case.
+      const created = await createBackgroundPage(this.context)
       this.currentIndex = 0
       return created
     }
     this.currentIndex = Math.min(this.currentIndex, pages.length - 1)
     const page = pages[this.currentIndex] ?? pages[0]
     if (page === undefined) {
-      const created = await this.context.newPage()
+      const created = await createBackgroundPage(this.context)
       this.currentIndex = 0
       return created
     }
